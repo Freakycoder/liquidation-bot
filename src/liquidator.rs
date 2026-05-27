@@ -17,6 +17,7 @@ use solana_sdk::{
 };
 use std::str::FromStr;
 
+const LIQUIDATE_LAYOUT_VERIFIED: bool = false;
 const MARGINFI_PROGRAM_ID: &str = "MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA";
 
 /// Holds the signer and submits liquidation transactions.
@@ -128,42 +129,77 @@ impl Liquidator {
     /// The account list below is the documented v2 layout. Treat it as a
     /// strong starting point, not gospel.
     fn build_liquidate_ix(&self, opp: &Opportunity) -> Result<Instruction> {
-        // Anchor instruction discriminator: SHA256("global:<name>")[0..8]
-        let disc = anchor_ix_disc("lending_account_liquidate");
-
-        // Instruction args: asset_amount (u64). How much of the liquidatee's
-        // collateral to seize, in native token units. A real bot computes
-        // the max allowed by the protocol's close factor; here we leave it
-        // as a field on Opportunity to be filled by the caller.
-        let asset_amount: u64 = opp.liquidate_asset_amount;
-
-        let mut data = Vec::with_capacity(16);
-        data.extend_from_slice(&disc);
-        data.extend_from_slice(&asset_amount.to_le_bytes());
-
-        // Documented account order for lending_account_liquidate (v2).
-        // CONFIRM each flag against the IDL.
-        let accounts = vec![
-            AccountMeta::new_readonly(opp.marginfi_group, false),     // group
-            AccountMeta::new(opp.asset_bank, false),                  // asset bank
-            AccountMeta::new_readonly(opp.asset_bank_oracle, false),  // asset oracle
-            AccountMeta::new(opp.liab_bank, false),                   // liability bank
-            AccountMeta::new_readonly(opp.liab_bank_oracle, false),   // liability oracle
-            AccountMeta::new(opp.liquidator_marginfi_account, false), // liquidator account
-            AccountMeta::new(self.keypair.pubkey(), true),            // liquidator authority (signer)
-            AccountMeta::new(opp.position, false),                    // liquidatee account
-            AccountMeta::new(opp.liab_bank_liquidity_vault, false),   // liab bank vault
-            AccountMeta::new(opp.asset_bank_liquidity_vault, false),  // asset bank vault
-            AccountMeta::new(opp.insurance_vault, false),             // insurance vault
-            AccountMeta::new_readonly(spl_token_program_id(), false), // token program
-            // ── remaining accounts ──
-            // Append here: liquidatee's active bank + oracle accounts for
-            // the post-liquidation health check. Pull these from the
-            // liquidatee's balances. WITHOUT THESE THE TX FAILS.
-        ];
-
-        Ok(Instruction { program_id: self.program_id, accounts, data })
+    // ── HARD SAFETY GATE ──────────────────────────────────────────────
+    // The account order and signer/writable flags below are the
+    // documented MarginFi v2 layout but have NOT been verified against
+    // the on-chain IDL in this build. Sending a malformed liquidation
+    // transaction can burn fees or behave unexpectedly. This guard must
+    // be flipped to true ONLY after:
+    //   1. fetching the IDL and confirming the account order
+    //   2. a successful dry-run liquidation on devnet
+    if !LIQUIDATE_LAYOUT_VERIFIED {
+        anyhow::bail!(
+            "lendingAccountLiquidate account layout not yet verified \
+             against the IDL; refusing to build instruction. See \
+             LIQUIDATE_LAYOUT_VERIFIED in liquidator.rs"
+        );
     }
+
+    // Reject an opportunity with unset accounts rather than sending
+    // a transaction full of system-program (zero) pubkeys.
+    let zero = Pubkey::default();
+    for (label, key) in [
+        ("marginfi_group", opp.marginfi_group),
+        ("asset_bank", opp.asset_bank),
+        ("asset_bank_oracle", opp.asset_bank_oracle),
+        ("asset_bank_liquidity_vault", opp.asset_bank_liquidity_vault),
+        ("liab_bank", opp.liab_bank),
+        ("liab_bank_oracle", opp.liab_bank_oracle),
+        ("liab_bank_liquidity_vault", opp.liab_bank_liquidity_vault),
+        ("insurance_vault", opp.insurance_vault),
+        ("liquidator_marginfi_account", opp.liquidator_marginfi_account),
+    ] {
+        if key == zero {
+            anyhow::bail!("opportunity field `{label}` is unset (zero pubkey)");
+        }
+    }
+    if opp.liquidate_asset_amount == 0 {
+        anyhow::bail!("liquidate_asset_amount is 0; refusing to send a no-op");
+    }
+
+    let disc = anchor_ix_disc("lending_account_liquidate");
+    let asset_amount: u64 = opp.liquidate_asset_amount;
+
+    let mut data = Vec::with_capacity(16);
+    data.extend_from_slice(&disc);
+    data.extend_from_slice(&asset_amount.to_le_bytes());
+
+    let mut accounts = vec![
+        AccountMeta::new_readonly(opp.marginfi_group, false),
+        AccountMeta::new(opp.asset_bank, false),
+        AccountMeta::new_readonly(opp.asset_bank_oracle, false),
+        AccountMeta::new(opp.liab_bank, false),
+        AccountMeta::new_readonly(opp.liab_bank_oracle, false),
+        AccountMeta::new(opp.liquidator_marginfi_account, false),
+        AccountMeta::new(self.keypair.pubkey(), true),
+        AccountMeta::new(opp.position, false),
+        AccountMeta::new(opp.liab_bank_liquidity_vault, false),
+        AccountMeta::new(opp.asset_bank_liquidity_vault, false),
+        AccountMeta::new(opp.insurance_vault, false),
+        AccountMeta::new_readonly(spl_token_program_id(), false),
+    ];
+
+    // ── Remaining accounts ────────────────────────────────────────────
+    // MarginFi appends, for the health check, the liquidatee's active
+    // bank accounts each followed by that bank's oracle. Without these
+    // the program's health assertion fails and the tx is rejected.
+    for (bank, oracle) in &opp.liquidatee_remaining_accounts {
+        accounts.push(AccountMeta::new_readonly(*bank, false));
+        accounts.push(AccountMeta::new_readonly(*oracle, false));
+    }
+
+    Ok(Instruction { program_id: self.program_id, accounts, data })
+}
 }
 
 /// Estimate net USD profit from a liquidation.

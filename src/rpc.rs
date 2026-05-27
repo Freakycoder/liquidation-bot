@@ -7,7 +7,7 @@ use solana_sdk::pubkey::Pubkey;
 
 /// Wraps the nonblocking RPC client with helpers the bot needs.
 pub struct Rpc {
-    client: RpcClient,
+    pub client: RpcClient,
 }
 
 impl Rpc {

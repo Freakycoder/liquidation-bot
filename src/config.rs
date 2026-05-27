@@ -19,6 +19,13 @@ pub struct Config {
     /// When true, only report opportunities; never build or send transactions.
     #[serde(default = "default_true")]
     pub dry_run: bool,
+    /// Path to a Solana CLI keypair file. When set, the bot will attempt
+    /// liquidations (gated by dry_run). When absent, it only reports.
+    #[serde(default)]
+    pub keypair_path: Option<String>,
+
+    #[serde(default = "default_min_debt")]
+    pub min_debt_usd: f64,
 }
 
 fn default_interval() -> u64 {
@@ -28,6 +35,8 @@ fn default_interval() -> u64 {
 fn default_true() -> bool {
     true
 }
+
+fn default_min_debt() -> f64 { 100.0 }
 
 impl Config {
     /// Load and parse the config file at `path`.

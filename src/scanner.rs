@@ -82,6 +82,24 @@ impl Scanner {
 
             let report = health::assess(&collateral, &liability);
             if !report.liquidatable { continue; }
+            if report.weighted_liability < self.cfg.min_debt_usd {
+                continue; // dust position, not worth acting on
+            }
+            let report = health::assess(&collateral, &liability);
+            if !report.liquidatable { continue; }
+            if report.weighted_liability < self.cfg.min_debt_usd { continue; }
+
+            // Skip artifacts: a position with effectively zero priceable
+            // collateral but real debt almost always means we failed to
+            // price its collateral bank (incomplete oracle coverage), not
+            // a genuine liquidation. A real target has seizable collateral.
+            if report.weighted_collateral < 1.0 {
+                tracing::debug!(
+                    position = %pos.address,
+                    "skipping: collateral unpriced (oracle coverage gap)"
+                );
+                continue;
+            }
 
             // Pick the largest-value bank on each side as the liquidation pair.
             let asset_bank = largest_bank(&pos.deposits, &banks, &prices, true);
@@ -108,9 +126,11 @@ impl Scanner {
             }
         }
 
-        tracing::info!(
-            scanned      = positions.len(),
-            liquidatable = opportunities.len(),
+       tracing::info!(
+            scanned          = positions.len(),
+            liquidatable     = opportunities.len(),
+            banks_priced     = prices.len(),
+            banks_total      = banks.len(),
             "pass complete"
         );
         Ok(())
