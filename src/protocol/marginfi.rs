@@ -12,24 +12,33 @@ use std::{collections::HashMap, str::FromStr};
 
 const MARGINFI_PROGRAM_ID: &str = "MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA";
 
-// ── Bank offsets (absolute, from start of account data) ──
+// Bank offsets (absolute, from start of account data).
 const BANK_MINT:               usize = 8;
 const BANK_MINT_DECIMALS:      usize = 40;
-// config begins at 296; BankConfig-relative offsets added below
+// group / vault offsets follow the IDL Bank field order and are consistent
+// with the verified anchors below (asset_share_value=80, config=296). They
+// are used only by the gated execution path, never by the scanner.
+const BANK_GROUP:              usize = 41;
+const BANK_ASSET_SHARE_VALUE:  usize = 80;
+const BANK_LIAB_SHARE_VALUE:   usize = 96;
+const BANK_LIQUIDITY_VAULT:    usize = 112;
+const BANK_INSURANCE_VAULT:    usize = 146;
+// config begins at 296; BankConfig-relative offsets added below.
 const BANK_CONFIG_START:       usize = 296;
 const CFG_ASSET_WEIGHT_MAINT:  usize = BANK_CONFIG_START + 16;   // 312
 const CFG_LIAB_WEIGHT_MAINT:   usize = BANK_CONFIG_START + 48;   // 344
 const CFG_ORACLE_SETUP:        usize = BANK_CONFIG_START + 313;  // 609
 const CFG_ORACLE_KEYS:         usize = BANK_CONFIG_START + 314;  // 610
-const BANK_ASSET_SHARE_VALUE:  usize = 80;
-const BANK_LIAB_SHARE_VALUE:   usize = 96;
 
-// OracleSetup enum (from IDL variant order)
-const ORACLE_PYTH_LEGACY:        u8 = 1;
-const ORACLE_PYTH_PUSH:          u8 = 3;
-const ORACLE_STAKED_PYTH_PUSH:   u8 = 5;
+// OracleSetup enum (from IDL variant order). Kept for documentation.
+#[allow(dead_code)]
+const ORACLE_PYTH_LEGACY:      u8 = 1;
+#[allow(dead_code)]
+const ORACLE_PYTH_PUSH:        u8 = 3;
+#[allow(dead_code)]
+const ORACLE_STAKED_PYTH_PUSH: u8 = 5;
 
-// ── MarginfiAccount offsets ──
+// MarginfiAccount offsets.
 const MFI_AUTHORITY:       usize = 40;
 const MFI_BALANCES_START:  usize = 72;
 const BALANCE_SLOTS:       usize = 16;
@@ -91,8 +100,11 @@ fn u8_at(data: &[u8], off: usize) -> Result<u8> {
 fn parse_bank(address: &Pubkey, data: &[u8]) -> Result<BankConfig> {
     let mint               = pubkey_at(data, BANK_MINT)?;
     let decimals           = u8_at(data, BANK_MINT_DECIMALS)?;
+    let group              = pubkey_at(data, BANK_GROUP)?;
     let asset_share_value  = i80f48_at(data, BANK_ASSET_SHARE_VALUE)?;
     let liab_share_value   = i80f48_at(data, BANK_LIAB_SHARE_VALUE)?;
+    let liquidity_vault    = pubkey_at(data, BANK_LIQUIDITY_VAULT)?;
+    let insurance_vault    = pubkey_at(data, BANK_INSURANCE_VAULT)?;
     let asset_weight_maint = i80f48_at(data, CFG_ASSET_WEIGHT_MAINT)?;
     let liab_weight_maint  = i80f48_at(data, CFG_LIAB_WEIGHT_MAINT)?;
     let oracle_setup       = u8_at(data, CFG_ORACLE_SETUP)?;
@@ -104,7 +116,7 @@ fn parse_bank(address: &Pubkey, data: &[u8]) -> Result<BankConfig> {
     if oracle_setup > 17 {
         tracing::warn!(
             bank = %address, raw = oracle_setup,
-            "oracle_setup out of range — offset wrong, check RatePoint size"
+            "oracle_setup out of range; offset wrong, check RatePoint size"
         );
     }
 
@@ -112,6 +124,7 @@ fn parse_bank(address: &Pubkey, data: &[u8]) -> Result<BankConfig> {
         address: *address, mint, oracle, decimals,
         asset_weight_maint, liab_weight_maint,
         asset_share_value, liab_share_value,
+        group, liquidity_vault, insurance_vault,
     })
 }
 

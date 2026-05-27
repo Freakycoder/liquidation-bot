@@ -4,6 +4,8 @@ use anyhow::{Context, Result};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::account::Account;
 use solana_sdk::pubkey::Pubkey;
+use std::time::Duration;
+use solana_sdk::commitment_config::CommitmentConfig;
 
 /// Wraps the nonblocking RPC client with helpers the bot needs.
 pub struct Rpc {
@@ -11,8 +13,13 @@ pub struct Rpc {
 }
 
 impl Rpc {
-    pub fn new(url: impl Into<String>) -> Self {
-        Self { client: RpcClient::new(url.into()) }
+   pub fn new(url: impl Into<String>) -> Self {
+        let client = RpcClient::new_with_timeout_and_commitment(
+            url.into(),
+            Duration::from_secs(90),
+            CommitmentConfig::confirmed(),
+        );
+        Self { client }
     }
 
     /// Access the underlying client for protocol-specific calls

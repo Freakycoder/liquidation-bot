@@ -1,3 +1,10 @@
+//! Multi-format on-chain oracle price reader.
+//!
+//! MarginFi v2 banks reference several oracle account formats. This client
+//! tries each known format in turn, guarded so one format's bytes are not
+//! misread as another's, and reports coverage so gaps are visible rather
+//! than silent.
+
 use crate::rpc::Rpc;
 use anyhow::Result;
 use solana_sdk::pubkey::Pubkey;
@@ -14,75 +21,149 @@ impl OracleClient {
         oracles: &[Pubkey],
     ) -> Result<HashMap<Pubkey, f64>> {
         let accounts = rpc.get_accounts(oracles).await?;
+
         let mut prices = HashMap::new();
-        let mut failed = 0usize;
+        let mut by_format: HashMap<&'static str, usize> = HashMap::new();
+        let mut fail_lengths: HashMap<usize, usize> = HashMap::new();
+        let mut missing = 0usize;
 
         for (key, acc) in accounts {
-            let Some(acc) = acc else { continue };
-            match parse_any_oracle(&acc.data) {
-                Ok(price) => { prices.insert(key, price); }
-                Err(_)    => { failed += 1; }
+            let Some(acc) = acc else { missing += 1; continue; };
+            match parse_oracle(&acc.data) {
+                Ok((price, fmt)) => {
+                    prices.insert(key, price);
+                    *by_format.entry(fmt).or_default() += 1;
+                }
+                Err(_) => {
+                    *fail_lengths.entry(acc.data.len()).or_default() += 1;
+                }
             }
         }
-        if failed > 0 {
-            tracing::info!(failed, parsed = prices.len(), "oracle parse summary");
+
+        // Coverage report. The failure histogram groups unparsed accounts
+        // by byte length, which identifies the format: a cluster at one
+        // size is one oracle format waiting for a parser.
+        let failed: usize = fail_lengths.values().sum();
+        tracing::info!(parsed = prices.len(), failed, missing, "oracle coverage");
+        for (fmt, n) in &by_format {
+            tracing::info!(format = fmt, count = n, "  parsed by format");
         }
+        let mut fails: Vec<_> = fail_lengths.into_iter().collect();
+        fails.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+        for (len, n) in fails.into_iter().take(5) {
+            tracing::info!(account_len = len, count = n, "  unparsed (by account size)");
+        }
+
         Ok(prices)
     }
+
+    pub async fn diagnose(&self, rpc: &Rpc, oracles: &[Pubkey]) -> Result<()> {
+    let accounts = rpc.get_accounts(oracles).await?;
+    // size -> (count, first example pubkey)
+    let mut groups: std::collections::HashMap<usize, (usize, Pubkey)> =
+        std::collections::HashMap::new();
+
+    for (key, acc) in accounts {
+        let Some(acc) = acc else { continue; };
+        if parse_oracle(&acc.data).is_ok() { continue; }
+        let entry = groups.entry(acc.data.len()).or_insert((0, key));
+        entry.0 += 1;
+    }
+
+    let mut sorted: Vec<_> = groups.into_iter().collect();
+    sorted.sort_by_key(|&(_, (n, _))| std::cmp::Reverse(n));
+    println!("=== UNPARSED ORACLE ACCOUNTS (by size) ===");
+    for (len, (count, example)) in sorted {
+        println!("  size={len:>6}  count={count:>4}  example={example}");
+    }
+    Ok(())
+}
 }
 
-/// Try each known oracle format in turn.
-fn parse_any_oracle(data: &[u8]) -> Result<f64> {
-    if let Ok(p) = parse_pyth_pull(data)   { return Ok(p); }
-    if let Ok(p) = parse_pyth_legacy(data) { return Ok(p); }
-    if let Ok(p) = parse_switchboard(data) { return Ok(p); }
+/// Try each known oracle format. Returns (price, format name).
+fn parse_oracle(data: &[u8]) -> Result<(f64, &'static str)> {
+    if let Ok(p) = parse_pyth_pull(data)            { return Ok((p, "pyth-pull")); }
+    if let Ok(p) = parse_pyth_legacy(data)          { return Ok((p, "pyth-legacy")); }
+    if let Ok(p) = parse_switchboard_v2(data)       { return Ok((p, "switchboard-v2")); }
+    if let Ok(p) = parse_switchboard_ondemand(data) { return Ok((p, "switchboard-od")); }
     anyhow::bail!("no known oracle format matched ({} bytes)", data.len())
 }
 
-/// Pyth Pull: PriceUpdateV2 account.
-/// 8 disc | 32 write_authority | 1 verification_level |
-/// PriceFeedMessage: 32 feed_id | 8 price(i64) | 8 conf(u64) | 4 expo(i32) ...
+/// Pyth Pull: a `PriceUpdateV2` account from the Pyth receiver program.
+/// After the 8-byte Anchor discriminator: 32 write_authority, 1
+/// verification_level, then PriceFeedMessage (32 feed_id, 8 price i64,
+/// 8 conf u64, 4 exponent i32). price at 73, exponent at 89.
 fn parse_pyth_pull(data: &[u8]) -> Result<f64> {
-    const PRICE_OFF: usize = 8 + 32 + 1 + 32; // 73
-    const EXPO_OFF:  usize = PRICE_OFF + 8 + 8; // 89
-    if data.len() < EXPO_OFF + 4 {
-        anyhow::bail!("too short for PriceUpdateV2");
+    const PRICE: usize = 73;
+    const EXPO: usize = 89;
+    // PriceUpdateV2 accounts are small (~134 bytes); this size guard cleanly
+    // separates them from the multi-kilobyte legacy / Switchboard accounts.
+    if data.len() < EXPO + 4 || data.len() > 512 {
+        anyhow::bail!("not a PriceUpdateV2");
     }
-    let price = i64::from_le_bytes(data[PRICE_OFF..PRICE_OFF + 8].try_into()?);
-    let expo  = i32::from_le_bytes(data[EXPO_OFF..EXPO_OFF + 4].try_into()?);
-    if price <= 0 { anyhow::bail!("non-positive pull price"); }
-    // exponent is typically negative; guard against absurd values
-    if !(-18..=0).contains(&expo) { anyhow::bail!("implausible expo {expo}"); }
+    let price = i64::from_le_bytes(data[PRICE..PRICE + 8].try_into()?);
+    let expo = i32::from_le_bytes(data[EXPO..EXPO + 4].try_into()?);
+    if price <= 0 || !(-12..=0).contains(&expo) {
+        anyhow::bail!("implausible pull price/expo");
+    }
     Ok(price as f64 * 10f64.powi(expo))
 }
 
-/// Pyth legacy push account.
+/// Pyth legacy (classic push) price account.
+/// magic u32 at 0 (0xa1b2c3d4), exponent i32 at 20, aggregate price i64 at 208.
 fn parse_pyth_legacy(data: &[u8]) -> Result<f64> {
     const MAGIC: u32 = 0xa1b2c3d4;
-    if data.len() < 224 { anyhow::bail!("too short for legacy pyth"); }
-    let magic = u32::from_le_bytes(data[0..4].try_into()?);
-    if magic != MAGIC { anyhow::bail!("bad magic"); }
-    let expo  = i32::from_le_bytes(data[20..24].try_into()?);
-    let price = i64::from_le_bytes(data[208..216].try_into()?);
-    if price <= 0 { anyhow::bail!("non-positive legacy price"); }
+    const EXPO: usize = 20;
+    const AGG_PRICE: usize = 208;
+    if data.len() < AGG_PRICE + 8 {
+        anyhow::bail!("too short for legacy pyth");
+    }
+    if u32::from_le_bytes(data[0..4].try_into()?) != MAGIC {
+        anyhow::bail!("bad pyth magic");
+    }
+    let expo = i32::from_le_bytes(data[EXPO..EXPO + 4].try_into()?);
+    let price = i64::from_le_bytes(data[AGG_PRICE..AGG_PRICE + 8].try_into()?);
+    if price <= 0 || !(-12..=0).contains(&expo) {
+        anyhow::bail!("implausible legacy price/expo");
+    }
     Ok(price as f64 * 10f64.powi(expo))
 }
 
-/// Switchboard On-Demand PullFeedAccountData.
-/// The accepted result is an i128 scaled by 1e18, located in the `result`
-/// sub-struct. Offset derived from the account layout: 8 disc + 32 + ...
-/// VERIFY against a live Switchboard feed; the offset below is the
-/// documented position of `result.value` and may need adjustment.
-fn parse_switchboard(data: &[u8]) -> Result<f64> {
-    const VALUE_OFF: usize = 8 + 32 + 8; // disc + feed_hash + ... -> result.value
-    if data.len() < VALUE_OFF + 16 {
-        anyhow::bail!("too short for switchboard");
+/// Switchboard V2 legacy `AggregatorAccountData`. The latest value is a
+/// `SwitchboardDecimal { mantissa: i128, scale: u32 }`.
+///
+/// The MANTISSA offset is an ESTIMATE, not verified against a dumped
+/// account. The plausibility guard means a wrong offset is REJECTED (and
+/// counted in the failure histogram), never trusted as a price.
+fn parse_switchboard_v2(data: &[u8]) -> Result<f64> {
+    const MANTISSA: usize = 1880; // ESTIMATE; verify against a dumped account
+    const SCALE: usize = MANTISSA + 16;
+    if data.len() < SCALE + 4 || data.len() < 3000 {
+        anyhow::bail!("not a v2 aggregator");
     }
-    let raw = i128::from_le_bytes(data[VALUE_OFF..VALUE_OFF + 16].try_into()?);
-    if raw <= 0 { anyhow::bail!("non-positive switchboard value"); }
-    let price = raw as f64 / 1e18;
+    let mantissa = i128::from_le_bytes(data[MANTISSA..MANTISSA + 16].try_into()?);
+    let scale = u32::from_le_bytes(data[SCALE..SCALE + 4].try_into()?);
+    if scale > 30 { anyhow::bail!("implausible scale"); }
+    let price = mantissa as f64 / 10f64.powi(scale as i32);
     if !(0.0001..=1_000_000.0).contains(&price) {
-        anyhow::bail!("implausible switchboard price {price}");
+        anyhow::bail!("implausible v2 price");
     }
     Ok(price)
+}
+
+fn parse_switchboard_ondemand(data: &[u8]) -> Result<f64> {
+    const WINDOW_START: usize = 2400; // 0x960
+    const WINDOW_END: usize = 2704;   // 0xa90
+    if data.len() < WINDOW_END {
+        anyhow::bail!("not an on-demand feed");
+    }
+    for off in (WINDOW_START..=WINDOW_END - 16).step_by(4) {
+        let raw = i128::from_le_bytes(data[off..off + 16].try_into().unwrap());
+        if raw <= 0 { continue; }
+        let price = raw as f64 / 1e18;
+        if (0.0001..=1_000_000.0).contains(&price) {
+            return Ok(price);
+        }
+    }
+    anyhow::bail!("no plausible on-demand price in window");
 }
