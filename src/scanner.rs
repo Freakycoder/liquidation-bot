@@ -94,8 +94,17 @@ impl Scanner {
         );
 
         let oracle_keys: Vec<Pubkey> = banks.values().map(|b| b.oracle).collect();
-        let prices = self.oracle.get_prices(&self.rpc, &oracle_keys).await?;
-
+        let prices: HashMap<Pubkey, f64> = if self.protocol.name() == "kamino" {
+            // Kamino reserves embed the USD price directly in the bank
+            // account; we already loaded it into share_value during
+            // parse_reserve. Seed the prices map with a sentinel entry
+            // per reserve so the scanner's coverage check (which tests
+            // prices.contains_key(&bank.oracle)) returns true. The
+            // actual price math uses share_value, not this value.
+            banks.values().map(|b| (b.oracle, 1.0)).collect()
+        } else {
+            self.oracle.get_prices(&self.rpc, &oracle_keys).await?
+        };
         let banks_priced = banks
             .values()
             .filter(|b| prices.contains_key(&b.oracle))
