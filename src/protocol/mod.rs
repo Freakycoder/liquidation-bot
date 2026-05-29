@@ -5,6 +5,7 @@ use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 
 pub mod marginfi;
+pub mod kamino;
 
 #[async_trait]
 pub trait LendingProtocol: Send + Sync {
@@ -16,6 +17,7 @@ pub trait LendingProtocol: Send + Sync {
 pub fn build(cfg: &Config) -> Result<Box<dyn LendingProtocol>> {
     match cfg.protocol.as_str() {
         "marginfi" => Ok(Box::new(marginfi::MarginFi::new())),
+        "kamino"   => Ok(Box::new(kamino::Kamino::new())),
         other => bail!("unsupported protocol: '{other}'"),
     }
 }

@@ -152,18 +152,17 @@ fn parse_switchboard_v2(data: &[u8]) -> Result<f64> {
 }
 
 fn parse_switchboard_ondemand(data: &[u8]) -> Result<f64> {
-    const WINDOW_START: usize = 2400; // 0x960
-    const WINDOW_END: usize = 2704;   // 0xa90
-    if data.len() < WINDOW_END {
+    const VALUE: usize = 2412;
+    if data.len() < VALUE + 16 || data.len() < 3000 {
         anyhow::bail!("not an on-demand feed");
     }
-    for off in (WINDOW_START..=WINDOW_END - 16).step_by(4) {
-        let raw = i128::from_le_bytes(data[off..off + 16].try_into().unwrap());
-        if raw <= 0 { continue; }
-        let price = raw as f64 / 1e18;
-        if (0.0001..=1_000_000.0).contains(&price) {
-            return Ok(price);
-        }
+    let raw = i128::from_le_bytes(data[VALUE..VALUE + 16].try_into()?);
+    if raw <= 0 {
+        anyhow::bail!("no current on-demand price");
     }
-    anyhow::bail!("no plausible on-demand price in window");
+    let price = raw as f64 / 1e18;
+    if !(0.0001..=1_000_000.0).contains(&price) {
+        anyhow::bail!("implausible on-demand price");
+    }
+    Ok(price)
 }

@@ -11,22 +11,15 @@ use anyhow::Result;
 use solana_sdk::pubkey::Pubkey;
 use std::{
     collections::{HashMap, HashSet},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
-/// A liquidatable position plus everything the liquidator needs to act.
-///
-/// Bank-derived fields are filled from BankConfig. `liquidator_marginfi_account`
-/// is operator-supplied and stays zeroed until real execution is wired; the
-/// liquidator's zero-pubkey check and the LIQUIDATE_LAYOUT_VERIFIED gate keep
-/// that safe.
 #[derive(Debug)]
 pub struct Opportunity {
     pub position: Pubkey,
     pub owner: Pubkey,
     pub report: HealthReport,
-
-    // Fields required for instruction construction.
     pub marginfi_group: Pubkey,
     pub asset_bank: Pubkey,
     pub asset_bank_oracle: Pubkey,
@@ -36,16 +29,13 @@ pub struct Opportunity {
     pub liab_bank_liquidity_vault: Pubkey,
     pub insurance_vault: Pubkey,
     pub liquidator_marginfi_account: Pubkey,
-    /// Amount of collateral to seize, native units. 0 = compute max.
     pub liquidate_asset_amount: u64,
-    /// Liquidatee's active (bank, oracle) pairs for the health check.
     pub liquidatee_remaining_accounts: Vec<(Pubkey, Pubkey)>,
 }
 
-/// The outcome of one scan pass: stats plus the liquidatable positions
-/// found, ranked by estimated profit (most profitable first).
 #[derive(Debug, Clone)]
 pub struct ScanResult {
+    pub protocol_name: String,
     pub banks_total: usize,
     pub banks_priced: usize,
     pub positions_scanned: usize,
@@ -53,7 +43,6 @@ pub struct ScanResult {
     pub opportunities: Vec<OppRow>,
 }
 
-/// One liquidatable position, flattened for display and ranking.
 #[derive(Debug, Clone)]
 pub struct OppRow {
     pub position: Pubkey,
@@ -66,7 +55,7 @@ pub struct OppRow {
 
 pub struct Scanner {
     cfg:        Config,
-    rpc:        Rpc,
+    rpc:        Arc<Rpc>,
     protocol:   Box<dyn LendingProtocol>,
     oracle:     OracleClient,
     liquidator: Option<Liquidator>,
@@ -75,18 +64,17 @@ pub struct Scanner {
 impl Scanner {
     pub fn new(
         cfg: Config,
+        rpc: Arc<Rpc>,
         protocol: Box<dyn LendingProtocol>,
         liquidator: Option<Liquidator>,
     ) -> Self {
-        let rpc = Rpc::new(cfg.rpc_url.clone());
         Self { cfg, rpc, protocol, oracle: OracleClient::new(), liquidator }
     }
 
-    /// Headless loop: scan, sleep, repeat.
     pub async fn run(&mut self) -> Result<()> {
         loop {
             if let Err(e) = self.scan_once().await {
-                tracing::error!("scan failed: {e:#}");
+                tracing::error!(protocol = self.protocol.name(), "scan failed: {e:#}");
             }
             tokio::time::sleep(Duration::from_secs(self.cfg.poll_interval_secs)).await;
         }
@@ -94,49 +82,67 @@ impl Scanner {
 
     pub async fn scan_once(&mut self) -> Result<ScanResult> {
         let started = Instant::now();
+        let proto_name = self.protocol.name().to_string();
 
         let banks     = self.protocol.load_banks(&self.rpc).await?;
         let positions = self.protocol.load_positions(&self.rpc).await?;
-        tracing::info!(banks = banks.len(), positions = positions.len(), "state loaded");
+        tracing::info!(
+            protocol = %proto_name,
+            banks = banks.len(),
+            positions = positions.len(),
+            "state loaded"
+        );
 
         let oracle_keys: Vec<Pubkey> = banks.values().map(|b| b.oracle).collect();
         let prices = self.oracle.get_prices(&self.rpc, &oracle_keys).await?;
-        tracing::info!(priced = prices.len(), "oracle prices fetched");
+
+        let banks_priced = banks
+            .values()
+            .filter(|b| prices.contains_key(&b.oracle))
+            .count();
+        tracing::info!(
+            protocol = %proto_name,
+            distinct_oracles = prices.len(),
+            banks_priced,
+            banks_total = banks.len(),
+            "oracle prices fetched"
+        );
 
         let mut opportunities = Vec::new();
         let mut rows: Vec<OppRow> = Vec::new();
+        let mut skipped_incomplete = 0usize;
 
         for pos in &positions {
-            let collateral = price_side(&pos.deposits, &banks, &prices, true);
-            let liability  = price_side(&pos.borrows,  &banks, &prices, false);
+            let (collateral, liability) = match (
+                price_side(&pos.deposits, &banks, &prices, true),
+                price_side(&pos.borrows,  &banks, &prices, false),
+            ) {
+                (Some(c), Some(l)) => (c, l),
+                _ => { skipped_incomplete += 1; continue; }
+            };
             if collateral.is_empty() || liability.is_empty() { continue; }
 
             let report = health::assess(&collateral, &liability);
             if !report.liquidatable { continue; }
-            // Dust filter: ignore positions too small to be worth acting on.
             if report.weighted_liability < self.cfg.min_debt_usd { continue; }
-            // Drop artifacts: real debt but no priceable collateral means
-            // the collateral bank's oracle was not parsed, not a true
-            // opportunity.
-            if report.weighted_collateral < 1.0 {
-                tracing::debug!(
+
+            const MAX_PLAUSIBLE_USD: f64 = 5_000_000.0;
+            if report.weighted_liability > MAX_PLAUSIBLE_USD
+                || report.weighted_collateral > MAX_PLAUSIBLE_USD
+            {
+                tracing::warn!(
+                    protocol = %proto_name,
                     position = %pos.address,
-                    "skipping: collateral unpriced (oracle coverage gap)"
+                    debt_usd = report.weighted_liability,
+                    collateral_usd = report.weighted_collateral,
+                    "skipping: implausible valuation"
                 );
                 continue;
             }
+            if report.weighted_collateral < 1.0 { continue; }
 
             let asset_bank = largest_bank(&pos.deposits, &banks, &prices, true);
             let liab_bank  = largest_bank(&pos.borrows,  &banks, &prices, false);
-
-            tracing::warn!(
-                position       = %pos.address,
-                owner          = %pos.owner,
-                health_factor  = format!("{:.4}", report.health_factor),
-                collateral_usd = format!("${:.2}", report.weighted_collateral),
-                debt_usd       = format!("${:.2}", report.weighted_liability),
-                "LIQUIDATABLE"
-            );
 
             rows.push(OppRow {
                 position: pos.address,
@@ -150,10 +156,8 @@ impl Scanner {
             opportunities.push(build_opportunity(pos, report, &banks, asset_bank, liab_bank));
         }
 
-        // Rank by estimated profit, most profitable first.
         rows.sort_by(|a, b| b.est_profit_usd.total_cmp(&a.est_profit_usd));
 
-        // Attempt execution if a liquidator is configured.
         if let Some(liquidator) = &self.liquidator {
             for opp in &opportunities {
                 if let Err(e) = liquidator.try_liquidate(&self.rpc, opp).await {
@@ -163,19 +167,22 @@ impl Scanner {
         }
 
         let result = ScanResult {
+            protocol_name: proto_name.clone(),
             banks_total: banks.len(),
-            banks_priced: prices.len(),
+            banks_priced,
             positions_scanned: positions.len(),
             scan_duration: started.elapsed(),
             opportunities: rows,
         };
 
         tracing::info!(
-            scanned      = result.positions_scanned,
-            liquidatable = result.opportunities.len(),
-            banks_priced = result.banks_priced,
-            banks_total  = result.banks_total,
-            elapsed_ms   = result.scan_duration.as_millis(),
+            protocol         = %proto_name,
+            scanned          = result.positions_scanned,
+            liquidatable     = result.opportunities.len(),
+            skipped_incomplete,
+            banks_priced     = result.banks_priced,
+            banks_total      = result.banks_total,
+            elapsed_ms       = result.scan_duration.as_millis(),
             "pass complete"
         );
 
@@ -183,9 +190,6 @@ impl Scanner {
     }
 }
 
-/// Build an Opportunity. Bank-derived fields are filled from BankConfig.
-/// `liquidator_marginfi_account` stays zeroed (operator-supplied); wire it
-/// before arming real execution.
 fn build_opportunity(
     pos: &crate::types::RawPosition,
     report: HealthReport,
@@ -195,12 +199,9 @@ fn build_opportunity(
 ) -> Opportunity {
     let asset_bank = asset_bank.unwrap_or_default();
     let liab_bank  = liab_bank.unwrap_or_default();
-
     let ab = banks.get(&asset_bank);
     let lb = banks.get(&liab_bank);
 
-    // Remaining accounts: every active bank on the liquidatee plus its
-    // oracle. Deduplicate so a bank used on both sides appears once.
     let mut seen = HashSet::new();
     let mut remaining = Vec::new();
     for (bank_addr, _) in pos.deposits.iter().chain(pos.borrows.iter()) {
@@ -211,8 +212,7 @@ fn build_opportunity(
     }
 
     Opportunity {
-        position: pos.address,
-        owner: pos.owner,
+        position: pos.address, owner: pos.owner,
         marginfi_group: lb.or(ab).map(|b| b.group).unwrap_or_default(),
         asset_bank,
         asset_bank_oracle:          ab.map(|b| b.oracle).unwrap_or_default(),
@@ -233,9 +233,10 @@ fn price_side(
     banks:         &HashMap<Pubkey, BankConfig>,
     prices:        &HashMap<Pubkey, f64>,
     is_collateral: bool,
-) -> Vec<PricedAsset> {
-    entries.iter().filter_map(|(bank_addr, shares)| {
-        let bank  = banks.get(bank_addr)?;
+) -> Option<Vec<PricedAsset>> {
+    let mut out = Vec::with_capacity(entries.len());
+    for (bank_addr, shares) in entries {
+        let bank = banks.get(bank_addr)?;
         let price = prices.get(&bank.oracle).copied()?;
         let (share_value, weight) = if is_collateral {
             (bank.asset_share_value, bank.asset_weight_maint)
@@ -243,11 +244,11 @@ fn price_side(
             (bank.liab_share_value, bank.liab_weight_maint)
         };
         let amount = shares * share_value / 10f64.powi(bank.decimals as i32);
-        Some(PricedAsset { mint: bank.mint, amount, price, weight })
-    }).collect()
+        out.push(PricedAsset { mint: bank.mint, amount, price, weight });
+    }
+    Some(out)
 }
 
-/// The bank holding the highest USD value on one side of a position.
 fn largest_bank(
     entries:       &[(Pubkey, f64)],
     banks:         &HashMap<Pubkey, BankConfig>,
