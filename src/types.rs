@@ -1,11 +1,7 @@
 //! Domain types shared across the bot.
-//!
-//! Every protocol implementation maps its own on-chain account layouts
-//! into these types, so the scanner and health logic stay protocol-agnostic.
 
 use solana_sdk::pubkey::Pubkey;
 
-/// Static config for one lending bank/reserve.
 #[derive(Debug, Clone)]
 pub struct BankConfig {
     pub address: Pubkey,
@@ -16,32 +12,60 @@ pub struct BankConfig {
     pub liab_weight_maint: f64,
     pub asset_share_value: f64,
     pub liab_share_value: f64,
-    /// The MarginFi group this bank belongs to. Parsed from the Bank
-    /// account header (group pubkey at data offset 8, per the IDL).
     pub group: Pubkey,
-    /// The bank's liquidity vault (holds the underlying token).
     pub liquidity_vault: Pubkey,
-    /// The bank's insurance vault.
     pub insurance_vault: Pubkey,
 }
 
-/// A borrower account with raw share amounts (not yet converted to tokens).
-/// Conversion: ui_amount = shares * share_value / 10^decimals
 #[derive(Debug, Clone)]
 pub struct RawPosition {
     pub address: Pubkey,
     pub owner: Pubkey,
-    /// (bank address, asset shares)
     pub deposits: Vec<(Pubkey, f64)>,
-    /// (bank address, liability shares)
     pub borrows: Vec<(Pubkey, f64)>,
 }
 
-/// An asset valued at a point in time, ready for health math.
 #[derive(Debug, Clone)]
 pub struct PricedAsset {
     pub mint: Pubkey,
     pub amount: f64,
     pub price: f64,
     pub weight: f64,
+}
+
+/// Forward-looking risk buckets: how many positions sit at each health
+/// threshold across ALL scanned positions (not just currently
+/// liquidatable). This is the opportunity pipeline.
+#[derive(Debug, Clone, Default)]
+pub struct RiskBuckets {
+    pub liquidatable: usize, // hf < 1.00
+    pub edge:         usize, // hf < 1.02
+    pub at_risk:      usize, // hf < 1.05
+    pub watch:        usize, // hf < 1.10
+    pub total_priced: usize, // every position fully priced this scan
+}
+
+#[derive(Debug, Clone)]
+pub struct WhaleRow {
+    pub position: Pubkey,
+    pub owner: Pubkey,
+    pub debt_usd: f64,
+    pub health_factor: f64,
+    pub liquidatable: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DivergenceRow {
+    pub mint: Pubkey,
+    pub sources: usize,
+    pub min_price: f64,
+    pub max_price: f64,
+    pub spread_pct: f64,
+}
+
+/// Chain state snapshot, taken once per scan.
+#[derive(Debug, Clone, Default)]
+pub struct ChainState {
+    pub slot: u64,
+    pub priority_fee_microlamports: u64,
 }

@@ -167,7 +167,14 @@ impl LendingProtocol for MarginFi {
         Ok(banks)
     }
 
-    async fn load_positions(&self, rpc: &Rpc) -> Result<Vec<RawPosition>> {
+    async fn load_positions(
+        &self,
+        rpc: &Rpc,
+        _banks: &HashMap<Pubkey, BankConfig>,
+    ) -> Result<Vec<RawPosition>> {
+        // MarginFi stores share-amounts directly and the scanner's
+        // shares * share_value / 10^decimals formula handles scaling, so
+        // the banks map is unused here.
         let disc = anchor_disc("MarginfiAccount");
         let raw = rpc.client
             .get_program_accounts_with_config(&self.program_id, rpc_config_with_disc(&disc))

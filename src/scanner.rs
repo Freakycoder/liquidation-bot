@@ -3,9 +3,12 @@ use crate::{
     health::{self, HealthReport},
     liquidator::{estimate_profit_usd, Liquidator},
     oracle::OracleClient,
-    protocol::LendingProtocol,
+    protocol::{ImplStatus, LendingProtocol},
     rpc::Rpc,
-    types::{BankConfig, PricedAsset},
+    types::{
+        BankConfig, ChainState, DivergenceRow, PricedAsset, RiskBuckets,
+        WhaleRow,
+    },
 };
 use anyhow::Result;
 use solana_sdk::pubkey::Pubkey;
@@ -36,11 +39,17 @@ pub struct Opportunity {
 #[derive(Debug, Clone)]
 pub struct ScanResult {
     pub protocol_name: String,
+    pub status: ImplStatus,
     pub banks_total: usize,
     pub banks_priced: usize,
     pub positions_scanned: usize,
     pub scan_duration: Duration,
     pub opportunities: Vec<OppRow>,
+    pub risk_buckets: RiskBuckets,
+    pub whale_watch: Vec<WhaleRow>,
+    pub oracle_divergence: Vec<DivergenceRow>,
+    pub chain: ChainState,
+    pub total_profit_usd: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +59,9 @@ pub struct OppRow {
     pub health_factor: f64,
     pub collateral_usd: f64,
     pub debt_usd: f64,
+    pub debt_repaid_usd: f64,
+    pub bonus_usd: f64,
+    pub cost_usd: f64,
     pub est_profit_usd: f64,
 }
 
@@ -71,6 +83,9 @@ impl Scanner {
         Self { cfg, rpc, protocol, oracle: OracleClient::new(), liquidator }
     }
 
+    pub fn name(&self) -> &'static str { self.protocol.name() }
+    pub fn impl_status(&self) -> ImplStatus { self.protocol.status() }
+
     pub async fn run(&mut self) -> Result<()> {
         loop {
             if let Err(e) = self.scan_once().await {
@@ -83,9 +98,29 @@ impl Scanner {
     pub async fn scan_once(&mut self) -> Result<ScanResult> {
         let started = Instant::now();
         let proto_name = self.protocol.name().to_string();
+        let proto_status = self.protocol.status();
 
-        let banks     = self.protocol.load_banks(&self.rpc).await?;
-        let positions = self.protocol.load_positions(&self.rpc).await?;
+        let chain = ChainState::default();
+
+        if proto_status == ImplStatus::Pending {
+            return Ok(ScanResult {
+                protocol_name: proto_name,
+                status: proto_status,
+                banks_total: 0,
+                banks_priced: 0,
+                positions_scanned: 0,
+                scan_duration: started.elapsed(),
+                opportunities: Vec::new(),
+                risk_buckets: RiskBuckets::default(),
+                whale_watch: Vec::new(),
+                oracle_divergence: Vec::new(),
+                chain,
+                total_profit_usd: 0.0,
+            });
+        }
+
+        let banks = self.protocol.load_banks(&self.rpc).await?;
+        let positions = self.protocol.load_positions(&self.rpc, &banks).await?;
         tracing::info!(
             protocol = %proto_name,
             banks = banks.len(),
@@ -95,12 +130,6 @@ impl Scanner {
 
         let oracle_keys: Vec<Pubkey> = banks.values().map(|b| b.oracle).collect();
         let prices: HashMap<Pubkey, f64> = if self.protocol.name() == "kamino" {
-            // Kamino reserves embed the USD price directly in the bank
-            // account; we already loaded it into share_value during
-            // parse_reserve. Seed the prices map with a sentinel entry
-            // per reserve so the scanner's coverage check (which tests
-            // prices.contains_key(&bank.oracle)) returns true. The
-            // actual price math uses share_value, not this value.
             banks.values().map(|b| (b.oracle, 1.0)).collect()
         } else {
             self.oracle.get_prices(&self.rpc, &oracle_keys).await?
@@ -117,8 +146,17 @@ impl Scanner {
             "oracle prices fetched"
         );
 
+        // Oracle divergence: group banks by mint, find mints whose oracles
+        // disagree. For Kamino (self-priced) we use the bank's stored
+        // share_value directly. For MarginFi we use oracle prices.
+        let oracle_divergence = compute_oracle_divergence(
+            &banks, &prices, self.protocol.name() == "kamino",
+        );
+
         let mut opportunities = Vec::new();
         let mut rows: Vec<OppRow> = Vec::new();
+        let mut whales: Vec<WhaleRow> = Vec::new();
+        let mut risk = RiskBuckets::default();
         let mut skipped_incomplete = 0usize;
 
         for pos in &positions {
@@ -132,40 +170,90 @@ impl Scanner {
             if collateral.is_empty() || liability.is_empty() { continue; }
 
             let report = health::assess(&collateral, &liability);
+
+            // Plausibility gate, shared by risk buckets, whale watch, and
+            // opportunity scoring. Positions that fail this are noise.
+            const MAX_PLAUSIBLE_USD: f64 = 1_000_000.0;
+            let ratio = report.weighted_liability
+                / report.weighted_collateral.max(1.0);
+            let plausible =
+                report.weighted_collateral >= 1.0
+                && report.weighted_liability >= 1.0
+                && report.weighted_liability <= MAX_PLAUSIBLE_USD
+                && report.weighted_collateral <= MAX_PLAUSIBLE_USD
+                && ratio <= 100.0;
+
+            if !plausible {
+                continue;
+            }
+
+            risk.total_priced += 1;
+            let hf = report.health_factor;
+            if hf < 1.10 { risk.watch += 1; }
+            if hf < 1.05 { risk.at_risk += 1; }
+            if hf < 1.02 { risk.edge += 1; }
+            if hf < 1.00 { risk.liquidatable += 1; }
+
+            // Whale watch on plausible positions only.
+            whales.push(WhaleRow {
+                position: pos.address,
+                owner: pos.owner,
+                debt_usd: report.weighted_liability,
+                health_factor: hf,
+                liquidatable: report.liquidatable,
+            });
+
             if !report.liquidatable { continue; }
             if report.weighted_liability < self.cfg.min_debt_usd { continue; }
 
-            const MAX_PLAUSIBLE_USD: f64 = 5_000_000.0;
-            if report.weighted_liability > MAX_PLAUSIBLE_USD
-                || report.weighted_collateral > MAX_PLAUSIBLE_USD
+            // Whale watch: track top positions by debt regardless of
+            // liquidatable status. Pre-filter sane values to avoid
+            // residual partial-pricing artifacts.
+            if report.weighted_liability > 100.0
+                && report.weighted_liability < 5_000_000.0
+                && report.weighted_collateral > 1.0
+                && report.weighted_liability / report.weighted_collateral.max(1.0) < 100.0
             {
-                tracing::warn!(
-                    protocol = %proto_name,
-                    position = %pos.address,
-                    debt_usd = report.weighted_liability,
-                    collateral_usd = report.weighted_collateral,
-                    "skipping: implausible valuation"
-                );
-                continue;
+                whales.push(WhaleRow {
+                    position: pos.address,
+                    owner: pos.owner,
+                    debt_usd: report.weighted_liability,
+                    health_factor: hf,
+                    liquidatable: report.liquidatable,
+                });
             }
-            if report.weighted_collateral < 1.0 { continue; }
+
+            if !report.liquidatable { continue; }
+            if report.weighted_liability < self.cfg.min_debt_usd { continue; }
 
             let asset_bank = largest_bank(&pos.deposits, &banks, &prices, true);
             let liab_bank  = largest_bank(&pos.borrows,  &banks, &prices, false);
 
+            let (bonus, cost) = profit_components(report.weighted_liability);
+            let est_profit = bonus - cost;
+
             rows.push(OppRow {
                 position: pos.address,
                 owner: pos.owner,
-                health_factor: report.health_factor,
+                health_factor: hf,
                 collateral_usd: report.weighted_collateral,
                 debt_usd: report.weighted_liability,
-                est_profit_usd: estimate_profit_usd(report.weighted_liability),
+                debt_repaid_usd: report.weighted_liability,
+                bonus_usd: bonus,
+                cost_usd: cost,
+                est_profit_usd: est_profit,
             });
 
             opportunities.push(build_opportunity(pos, report, &banks, asset_bank, liab_bank));
         }
 
         rows.sort_by(|a, b| b.est_profit_usd.total_cmp(&a.est_profit_usd));
+
+        // Top whales by debt, keep 6.
+        whales.sort_by(|a, b| b.debt_usd.total_cmp(&a.debt_usd));
+        whales.truncate(6);
+
+        let total_profit_usd: f64 = rows.iter().map(|r| r.est_profit_usd).sum();
 
         if let Some(liquidator) = &self.liquidator {
             for opp in &opportunities {
@@ -177,26 +265,79 @@ impl Scanner {
 
         let result = ScanResult {
             protocol_name: proto_name.clone(),
+            status: proto_status,
             banks_total: banks.len(),
             banks_priced,
             positions_scanned: positions.len(),
             scan_duration: started.elapsed(),
             opportunities: rows,
+            risk_buckets: risk,
+            whale_watch: whales,
+            oracle_divergence,
+            chain,
+            total_profit_usd,
         };
 
         tracing::info!(
             protocol         = %proto_name,
             scanned          = result.positions_scanned,
             liquidatable     = result.opportunities.len(),
+            risk_edge        = result.risk_buckets.edge,
+            risk_watch       = result.risk_buckets.watch,
+            divergent_mints  = result.oracle_divergence.len(),
             skipped_incomplete,
-            banks_priced     = result.banks_priced,
-            banks_total      = result.banks_total,
             elapsed_ms       = result.scan_duration.as_millis(),
+            slot             = result.chain.slot,
             "pass complete"
         );
 
         Ok(result)
     }
+}
+
+fn profit_components(debt_usd: f64) -> (f64, f64) {
+    const LIQUIDATOR_BONUS: f64 = 0.025;
+    const COST_ALLOWANCE_USD: f64 = 0.50;
+    (debt_usd * LIQUIDATOR_BONUS, COST_ALLOWANCE_USD)
+}
+
+fn compute_oracle_divergence(
+    banks: &HashMap<Pubkey, BankConfig>,
+    prices: &HashMap<Pubkey, f64>,
+    kamino_mode: bool,
+) -> Vec<DivergenceRow> {
+    // Map mint -> distinct price values observed.
+    let mut by_mint: HashMap<Pubkey, Vec<f64>> = HashMap::new();
+    for bank in banks.values() {
+        let price = if kamino_mode {
+            // Kamino: per-reserve self-price stored in share_value.
+            if bank.asset_share_value > 0.0 { bank.asset_share_value } else { continue }
+        } else {
+            match prices.get(&bank.oracle) {
+                Some(p) if *p > 0.0 => *p,
+                _ => continue,
+            }
+        };
+        by_mint.entry(bank.mint).or_default().push(price);
+    }
+
+    let mut out = Vec::new();
+    for (mint, mut ps) in by_mint {
+        // Dedup near-identical readings so multiple banks pointing at the
+        // same oracle don't inflate `sources`.
+        ps.sort_by(|a, b| a.total_cmp(b));
+        ps.dedup_by(|a, b| (*a - *b).abs() / b.abs().max(1e-9) < 1e-6);
+        if ps.len() < 2 { continue; }
+        let min = ps.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = ps.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let spread_pct = (max - min) / ((min + max) / 2.0) * 100.0;
+        out.push(DivergenceRow {
+            mint, sources: ps.len(), min_price: min, max_price: max, spread_pct,
+        });
+    }
+    out.sort_by(|a, b| b.spread_pct.total_cmp(&a.spread_pct));
+    out.truncate(8);
+    out
 }
 
 fn build_opportunity(
@@ -238,9 +379,9 @@ fn build_opportunity(
 }
 
 fn price_side(
-    entries:       &[(Pubkey, f64)],
-    banks:         &HashMap<Pubkey, BankConfig>,
-    prices:        &HashMap<Pubkey, f64>,
+    entries: &[(Pubkey, f64)],
+    banks:   &HashMap<Pubkey, BankConfig>,
+    prices:  &HashMap<Pubkey, f64>,
     is_collateral: bool,
 ) -> Option<Vec<PricedAsset>> {
     let mut out = Vec::with_capacity(entries.len());
@@ -259,9 +400,9 @@ fn price_side(
 }
 
 fn largest_bank(
-    entries:       &[(Pubkey, f64)],
-    banks:         &HashMap<Pubkey, BankConfig>,
-    prices:        &HashMap<Pubkey, f64>,
+    entries: &[(Pubkey, f64)],
+    banks:   &HashMap<Pubkey, BankConfig>,
+    prices:  &HashMap<Pubkey, f64>,
     is_collateral: bool,
 ) -> Option<Pubkey> {
     entries.iter().filter_map(|(bank_addr, shares)| {
