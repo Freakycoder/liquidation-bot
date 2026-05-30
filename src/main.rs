@@ -80,12 +80,8 @@ async fn main() -> Result<()> {
         cfg.clone(), rpc.clone(),
         Box::new(protocol::drift::Drift::new()), None,
     );
-    let solend_scanner = scanner::Scanner::new(
-        cfg.clone(), rpc.clone(),
-        Box::new(protocol::solend::Solend::new()), None,
-    );
 
-    let scanners = vec![mfi_scanner, kam_scanner, drift_scanner, solend_scanner];
+    let scanners = vec![mfi_scanner, kam_scanner, drift_scanner];
 
     if cli.once {
         for mut s in scanners { s.scan_once().await?; }

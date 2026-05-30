@@ -170,21 +170,31 @@ pub async fn run(scanners: Vec<Scanner>, poll_interval: Duration, rpc: std::sync
         Panel::new(s.name(), accents[i % accents.len()], s.impl_status())
     }).collect();
 
-    for mut scanner in scanners {
+    // Single sequential worker: one scanner at a time, no overlap.
+    // The only reliable pattern when getProgramAccounts is rate-limited
+    // (free-tier RPC). Cycle = sum of all scan times plus small gaps.
+    tokio::spawn({
         let tx = tx.clone();
-        tokio::spawn(async move {
-            let pname = scanner.name().to_string();
+        async move {
+            let mut scanners = scanners;
             loop {
-                let _ = tx.send(ScanUpdate::Started { protocol: pname.clone() }).await;
-                let update = match scanner.scan_once().await {
-                    Ok(r) => ScanUpdate::Done(Box::new(r)),
-                    Err(e) => ScanUpdate::Failed { protocol: pname.clone(), err: format!("{e:#}") },
-                };
-                if tx.send(update).await.is_err() { break; }
+                for scanner in scanners.iter_mut() {
+                    let pname = scanner.name().to_string();
+                    let _ = tx.send(ScanUpdate::Started { protocol: pname.clone() }).await;
+                    let update = match scanner.scan_once().await {
+                        Ok(r) => ScanUpdate::Done(Box::new(r)),
+                        Err(e) => ScanUpdate::Failed {
+                            protocol: pname,
+                            err: format!("{e:#}"),
+                        },
+                    };
+                    if tx.send(update).await.is_err() { return; }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
                 tokio::time::sleep(poll_interval).await;
             }
-        });
-    }
+        }
+    });
     {
         let tx = tx.clone();
         let rpc = rpc.clone();

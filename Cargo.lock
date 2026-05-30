@@ -2283,6 +2283,7 @@ dependencies = [
  "async-trait",
  "clap 4.6.1",
  "crossterm",
+ "once_cell",
  "ratatui",
  "serde",
  "serde_json",

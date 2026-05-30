@@ -194,26 +194,10 @@ impl Scanner {
             if hf < 1.02 { risk.edge += 1; }
             if hf < 1.00 { risk.liquidatable += 1; }
 
-            // Whale watch on plausible positions only.
-            whales.push(WhaleRow {
-                position: pos.address,
-                owner: pos.owner,
-                debt_usd: report.weighted_liability,
-                health_factor: hf,
-                liquidatable: report.liquidatable,
-            });
-
-            if !report.liquidatable { continue; }
-            if report.weighted_liability < self.cfg.min_debt_usd { continue; }
-
-            // Whale watch: track top positions by debt regardless of
-            // liquidatable status. Pre-filter sane values to avoid
-            // residual partial-pricing artifacts.
-            if report.weighted_liability > 100.0
-                && report.weighted_liability < 5_000_000.0
-                && report.weighted_collateral > 1.0
-                && report.weighted_liability / report.weighted_collateral.max(1.0) < 100.0
-            {
+            // Whale watch: only positions large enough to be interesting.
+            // Threshold of $10k keeps the vector small (a few hundred max)
+            // so sort+truncate is cheap.
+            if report.weighted_liability >= 10_000.0 {
                 whales.push(WhaleRow {
                     position: pos.address,
                     owner: pos.owner,

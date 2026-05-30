@@ -1,6 +1,6 @@
-rpc_url = "https://mainnet.helius-rpc.com/?api-key=f133940f-4378-48ec-8b1a-978b8d303ece"
+rpc_url = "https://mainnet.helius-rpc.com/?api-key=6677dfd4-d031-4e95-92a6-b08c68985a94"
 protocol = "marginfi"
-poll_interval_secs = 15
+poll_interval_secs = 60
 min_profit_usd = 1.0
 dry_run = true
 min_debt_usd = 100.0

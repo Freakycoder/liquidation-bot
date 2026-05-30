@@ -7,7 +7,6 @@ use std::collections::HashMap;
 pub mod marginfi;
 pub mod kamino;
 pub mod drift;
-pub mod solend;
 
 /// Implementation status for the dashboard. Pending protocols are
 /// registered (trait wired) but their parsers are not yet verified
@@ -33,7 +32,6 @@ pub fn build(cfg: &Config) -> Result<Box<dyn LendingProtocol>> {
         "marginfi" => Ok(Box::new(marginfi::MarginFi::new())),
         "kamino"   => Ok(Box::new(kamino::Kamino::new())),
         "drift"    => Ok(Box::new(drift::Drift::new())),
-        "solend"   => Ok(Box::new(solend::Solend::new())),
         other => bail!("unsupported protocol: '{other}'"),
     }
 }

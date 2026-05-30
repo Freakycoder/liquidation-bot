@@ -15,7 +15,7 @@ impl Rpc {
     pub fn new(url: impl Into<String>) -> Self {
         let client = RpcClient::new_with_timeout_and_commitment(
             url.into(),
-            Duration::from_secs(90),
+            Duration::from_secs(180),
             CommitmentConfig::confirmed(),
         );
         Self { client }
